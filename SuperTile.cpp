@@ -33,16 +33,62 @@ static PF_Err ParamsSetup(
 	PF_LayerDef	*output
 ) {
 	PF_ParamDef	def;
+	
+	// Create UI params
 	AEFX_CLR_STRUCT(def);
 	PF_ADD_LAYER("Target Layer", PF_LayerDefault_NONE, ST_TARGET_LAYER_ID);
 	AEFX_CLR_STRUCT(def);
 	PF_ADD_FLOAT_SLIDERX("Tile Size", ST_SIZE_MIN, ST_SIZE_MAX, ST_SIZE_MIN, ST_SIZE_MAX, ST_SIZE_DFLT, PF_Precision_INTEGER, NULL, PF_PUI_NONE, ST_SIZE_SRC_ID);
 	AEFX_CLR_STRUCT(def);
 	PF_ADD_FLOAT_SLIDERX("Output Size", ST_SIZE_MIN, ST_SIZE_MAX, ST_SIZE_MIN, ST_SIZE_MAX, ST_SIZE_DFLT, PF_Precision_INTEGER, NULL, PF_PUI_NONE, ST_SIZE_DEST_ID);
-	AEFX_CLR_STRUCT(def);
-	PF_ADD_POINT("Offset", ST_OFFSET_X_DFLT, ST_OFFSET_Y_DFLT, NULL, ST_OFFSET_ID);
 	out_data->num_params = ST_NUM_PARAMS;
+	
 	return PF_Err_NONE;
+}
+
+static PF_Err Sample(
+	PF_InData *in_data,
+	PF_LayerDef *layer,
+	HSL *hsl_array,
+	double tile_size,
+	double tile_offset,
+	int columns,
+	int index_max,
+	bool world_is_deep
+) {
+	PF_Err err = PF_Err_NONE;
+
+	// Setup
+	AEGP_SuiteHandler suites(in_data->pica_basicP);
+	PF_SampPB src_sampPB;
+	src_sampPB.src = layer;
+	src_sampPB.x_radius = D2FIX(tile_offset);
+	src_sampPB.y_radius = D2FIX(tile_offset);
+
+	// Sample
+	if (world_is_deep) {
+		for (int i = 0; i < index_max; ++i) {
+			int x = i % columns;
+			int y = (i - x) / columns;
+			PF_Fixed fX = D2FIX(round(x * tile_size + tile_offset));
+			PF_Fixed fY = D2FIX(round(y * tile_size + tile_offset));
+			PF_Pixel16 pixel;
+			ERR(suites.Sampling16Suite1()->area_sample16(in_data->effect_ref, fX, fY, &src_sampPB, &pixel));
+			getHSL16(&pixel, &hsl_array[i]);
+		}
+	} else {
+		for (int i = 0; i < index_max; ++i) {
+			int x = i % columns;
+			int y = (i - x) / columns;
+			PF_Fixed fX = D2FIX(round(x * tile_size + tile_offset));
+			PF_Fixed fY = D2FIX(round(y * tile_size + tile_offset));
+			PF_Pixel8 pixel;
+			ERR(suites.Sampling8Suite1()->area_sample(in_data->effect_ref, fX, fY, &src_sampPB, &pixel));
+			getHSL8(&pixel, &hsl_array[i]);
+		}
+	}
+
+	return err;
 }
 
 static PF_Err Render(
@@ -54,19 +100,19 @@ static PF_Err Render(
 	PF_Err err = PF_Err_NONE;
 	PF_Err err2 = PF_Err_NONE;
 
+	// Setup
 	AEGP_SuiteHandler suites(in_data->pica_basicP);
 	PF_EffectWorld *input_layer = &params[ST_INPUT]->u.ld;
 	double qscale = input_layer->width / (double)in_data->width;
+	bool world_is_deep = PF_WORLD_IS_DEEP(output);
 
-	// Effect Params
+	// Effect params
 	double src_tile_size = params[ST_SIZE_SRC_ID]->u.fs_d.value * qscale;
 	double src_tile_offset = src_tile_size / 2;
 	double input_tile_size = params[ST_SIZE_DEST_ID]->u.fs_d.value * qscale;
 	double input_tile_offset = input_tile_size / 2;
-	//PF_Fixed offset_x = params[ST_OFFSET_ID]->u.td.x_value;
-	//PF_Fixed offset_y = params[ST_OFFSET_ID]->u.td.y_value;
 		
-	// Checkout Tile Layer
+	// Checkout tile layer
 	PF_ParamDef checkout;
 	AEFX_CLR_STRUCT(checkout);
 	ERR(PF_CHECKOUT_PARAM(in_data, ST_TARGET_LAYER_ID, in_data->current_time, in_data->time_step, in_data->time_scale, &checkout));
@@ -79,7 +125,7 @@ static PF_Err Render(
 		int input_columns = (int)ceil(input_layer->width / input_tile_size);
 		int input_rows = (int)ceil(input_layer->height / input_tile_size);
 		int input_cell_count = input_columns * input_rows;
-			
+		
 		// Allocate memory
 		AEGP_MemHandle mem_handle_src;
 		HSL *src_hsl;
@@ -94,38 +140,12 @@ static PF_Err Render(
 		ERR(suites.MemorySuite1()->AEGP_LockMemHandle(mem_handle_input, (void**)&input_hsl));
 
 		// Sample source layer and get HSL
-		PF_SampPB src_sampPB;
-		src_sampPB.src = &checkout.u.ld;
-		src_sampPB.x_radius = D2FIX(src_tile_offset);
-		src_sampPB.y_radius = D2FIX(src_tile_offset);
-			
-		for (int i = 0; i < src_cell_count; ++i) {
-			int x = i % src_columns;
-			int y = (i - x) / src_columns;
-			PF_Fixed fX = D2FIX(round(x * src_tile_size + src_tile_offset));
-			PF_Fixed fY = D2FIX(round(y * src_tile_size + src_tile_offset));
-			PF_Pixel8 pixel;
-			suites.Sampling8Suite1()->area_sample(in_data->effect_ref, fX, fY, &src_sampPB, &pixel);
-			getHSL(&pixel, &src_hsl[i]);
-		}
-
+		Sample(in_data, &checkout.u.ld, src_hsl, src_tile_size, src_tile_offset, src_columns, src_cell_count, world_is_deep);
+		
 		// Sample input layer and get HSL
-		PF_SampPB input_sampPB;
-		input_sampPB.src = input_layer;
-		input_sampPB.x_radius = D2FIX(input_tile_offset);
-		input_sampPB.y_radius = D2FIX(input_tile_offset);
+		Sample(in_data, input_layer, input_hsl, input_tile_size, input_tile_offset, input_columns, input_cell_count, world_is_deep);
 
-		for (int i = 0; i < input_cell_count; ++i) {
-			int x = i % input_columns;
-			int y = (i - x) / input_columns;
-			PF_Fixed fX = D2FIX(round(x * input_tile_size + input_tile_offset));
-			PF_Fixed fY = D2FIX(round(y * input_tile_size + input_tile_offset));
-			PF_Pixel8 pixel;
-			suites.Sampling8Suite1()->area_sample(in_data->effect_ref, fX, fY, &input_sampPB, &pixel);
-			getHSL(&pixel, &input_hsl[i]);
-		}
-
-		// Clear the output
+		// Clear output buffer
 		PF_Rect clear_rect;
 		clear_rect.left = in_data->output_origin_x;
 		clear_rect.right = clear_rect.left + input_layer->width;
@@ -168,9 +188,6 @@ static PF_Err Render(
 			suites.WorldTransformSuite1()->copy(in_data->effect_ref, &checkout.u.ld, output, &src_rect, &dest_rect);
 		}
 
-		// Render
-		// if (PF_WORLD_IS_DEEP(output))
-
 		// Free up memory
 		suites.MemorySuite1()->AEGP_UnlockMemHandle(mem_handle_input);
 		suites.MemorySuite1()->AEGP_UnlockMemHandle(mem_handle_src);
@@ -203,7 +220,7 @@ PF_Err PluginDataEntryFunction(
 		inPtr,
 		inPluginDataCallBackPtr,
 		"SuperTile", // Name
-		"ADBE_SuperTile_1", // Match Name
+		"ADBE_Super_Tile", // Match Name
 		"Meatbags", // Category
 		AE_RESERVED_INFO
 	);
